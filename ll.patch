@@ -1,0 +1,513 @@
+diff --git a/clang/include/clang/Driver/Options.td b/clang/include/clang/Driver/Options.td
+index 56e8b76def50..ae89e7bd8e17 100644
+--- a/clang/include/clang/Driver/Options.td
++++ b/clang/include/clang/Driver/Options.td
+@@ -4133,6 +4133,10 @@ def mno_retpoline_external_thunk : Flag<["-"], "mno-retpoline-external-thunk">,
+ def mvzeroupper : Flag<["-"], "mvzeroupper">, Group<m_x86_Features_Group>;
+ def mno_vzeroupper : Flag<["-"], "mno-vzeroupper">, Group<m_x86_Features_Group>;
+ 
++foreach i = {12-15} in
++  def mfixed_r#i : Flag<["-"], "mfixed-r"#i>, Group<m_x86_Features_Group>,
++    HelpText<"Reserve the r"#i#" register (x86 only)">;
++
+ // These are legacy user-facing driver-level option spellings. They are always
+ // aliases for options that are spelled using the more common Unix / GNU flag
+ // style of double-dash and equals-joined flags.
+diff --git a/clang/lib/Basic/Targets/X86.cpp b/clang/lib/Basic/Targets/X86.cpp
+index ee5b6cb3c087..64133526bcfe 100644
+--- a/clang/lib/Basic/Targets/X86.cpp
++++ b/clang/lib/Basic/Targets/X86.cpp
+@@ -314,6 +314,14 @@ bool X86TargetInfo::handleTargetFeatures(std::vector<std::string> &Features,
+       HasTSXLDTRK = true;
+     } else if (Feature == "+uintr") {
+       HasUINTR = true;
++    } else if (Feature == "+fixed-r12") {
++      ReservedRRegs[4] = true;
++    } else if (Feature == "+fixed-r13") {
++      ReservedRRegs[5] = true;
++    } else if (Feature == "+fixed-r14") {
++      ReservedRRegs[6] = true;
++    } else if (Feature == "+fixed-r15") {
++      ReservedRRegs[7] = true;
+     }
+ 
+     X86SSEEnum Level = llvm::StringSwitch<X86SSEEnum>(Feature)
+@@ -914,6 +922,10 @@ bool X86TargetInfo::isValidFeatureName(StringRef Name) const {
+       .Case("xsavec", true)
+       .Case("xsaves", true)
+       .Case("xsaveopt", true)
++      .Case("fixed-r12", true)
++      .Case("fixed-r13", true)
++      .Case("fixed-r14", true)
++      .Case("fixed-r15", true)
+       .Default(false);
+ }
+ 
+@@ -1009,6 +1021,10 @@ bool X86TargetInfo::hasFeature(StringRef Feature) const {
+       .Case("xsavec", HasXSAVEC)
+       .Case("xsaves", HasXSAVES)
+       .Case("xsaveopt", HasXSAVEOPT)
++      .Case("fixed-r12", ReservedRRegs[4])
++      .Case("fixed-r13", ReservedRRegs[5])
++      .Case("fixed-r14", ReservedRRegs[6])
++      .Case("fixed-r15", ReservedRRegs[7])
+       .Default(false);
+ }
+ 
+diff --git a/clang/lib/Basic/Targets/X86.h b/clang/lib/Basic/Targets/X86.h
+index 86a9339744b2..d1ed082209bb 100644
+--- a/clang/lib/Basic/Targets/X86.h
++++ b/clang/lib/Basic/Targets/X86.h
+@@ -16,6 +16,7 @@
+ #include "OSTargets.h"
+ #include "clang/Basic/TargetInfo.h"
+ #include "clang/Basic/TargetOptions.h"
++#include "llvm/ADT/BitVector.h"
+ #include "llvm/ADT/Triple.h"
+ #include "llvm/Support/Compiler.h"
+ #include "llvm/Support/X86TargetParser.h"
+@@ -146,6 +147,8 @@ protected:
+ 
+   enum FPMathKind { FP_Default, FP_SSE, FP_387 } FPMath = FP_Default;
+ 
++  llvm::BitVector ReservedRRegs;
++
+ public:
+   X86TargetInfo(const llvm::Triple &Triple, const TargetOptions &)
+       : TargetInfo(Triple) {
+@@ -157,6 +160,9 @@ public:
+         getTriple().isOSWindows() && getTriple().isOSBinFormatCOFF();
+     if (IsWinCOFF)
+       MaxVectorAlign = MaxTLSAlign = 8192u * getCharWidth();
++
++    // BitVector for r8-r15 register reservation flag
++    ReservedRRegs.resize(8);
+   }
+ 
+   const char *getLongDoubleMangling() const override {
+@@ -743,6 +749,27 @@ public:
+       return true;
+     }
+ 
++    // callee saved registers r12-r15 if they are set as reserved
++    // via -mfixed-r# flag
++    bool RegIsReserved = false;
++    const StringRef RRegsNames[] = {
++      "r8",  "r9", "r10", "r11",
++      "r12", "r13", "r14", "r15"
++    };
++    for(unsigned i = 4; i < ReservedRRegs.size() && !RegIsReserved; i++)
++      RegIsReserved |= RegName.startswith(RRegsNames[i]) && ReservedRRegs[i];
++    if (RegIsReserved) {
++      unsigned ReadedRegSize =
++      llvm::StringSwitch<unsigned>(RegName.substr(3))
++        .Case("",64)
++        .Case("d",32)
++        .Case("w",16)
++        .Case("b",8)
++        .Default(0);
++      HasSizeMismatch = RegSize != ReadedRegSize;
++      return true;
++    }
++
+     // Check if the register is a 32-bit register the backend can handle.
+     return X86TargetInfo::validateGlobalRegisterVariable(RegName, RegSize,
+                                                          HasSizeMismatch);
+diff --git a/clang/test/CodeGen/X86/fixed-reg-named-reg-global.c b/clang/test/CodeGen/X86/fixed-reg-named-reg-global.c
+new file mode 100644
+index 000000000000..3f79fa993243
+--- /dev/null
++++ b/clang/test/CodeGen/X86/fixed-reg-named-reg-global.c
+@@ -0,0 +1,121 @@
++// REQUIRES: x86-registered-target
++// RUN: sed 's/_TYPE_/uint64_t/g;s/_REG_/r12/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r12 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint32_t/g;s/_REG_/r12d/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r12 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint16_t/g;s/_REG_/r12w/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r12 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint8_t/g;s/_REG_/r12b/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r12 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++
++
++// RUN: sed 's/_TYPE_/uint64_t/g;s/_REG_/r13/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r13 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint32_t/g;s/_REG_/r13d/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r13 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint16_t/g;s/_REG_/r13w/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r13 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint8_t/g;s/_REG_/r13b/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r13 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++
++
++// RUN: sed 's/_TYPE_/uint64_t/g;s/_REG_/r14/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r14 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint32_t/g;s/_REG_/r14d/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r14 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint16_t/g;s/_REG_/r14w/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r14 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint8_t/g;s/_REG_/r14b/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r14 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++
++
++// RUN: sed 's/_TYPE_/uint64_t/g;s/_REG_/r15/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r15 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint32_t/g;s/_REG_/r15d/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r15 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint16_t/g;s/_REG_/r15w/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r15 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++// RUN: sed 's/_TYPE_/uint8_t/g;s/_REG_/r15b/g' %s > %t
++// RUN: %clang -x c - < %t -O0 2> %t1 || echo
++// RUN: FileCheck < %t1 %t
++// RUN: %clang -x c - < %t -mfixed-r15 -O0 -S -emit-llvm -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++#include <stdint.h>
++
++// CHECK: error:
++// CHECK-SAME: register '_REG_' unsuitable for global register variables on this target
++// CHECK-HAVE-RESERVATION-NOT: @_REG_ = common global
++register _TYPE_ R asm("_REG_");
++
++// CHECK-HAVE-RESERVATION: define{{.*}} i[[bits:[0-9]+]] @get_register_value
++// CHECK-HAVE-RESERVATION: [[ret:%[0-9]+]] = call i[[bits]] @llvm.read_register.i[[bits]](metadata !0)
++// CHECK-HAVE-RESERVATION: ret i[[bits]] [[ret]]
++_TYPE_ get_register_value() {
++    return R;
++}
++// CHECK-HAVE-RESERVATION: declare{{.*}} i[[bits]] @llvm.read_register.i[[bits]](metadata)
++
++
++// CHECK-HAVE-RESERVATION: define{{.*}} void @set_register_value
++// CHECK-HAVE-RESERVATION: [[sto:%[0-9]+]] = load i[[bits]], i[[bits]]* %
++// CHECK-HAVE-RESERVATION: call void @llvm.write_register.i[[bits]](metadata !0, i[[bits]] [[sto]])
++// CHECK-HAVE-RESERVATION: ret void
++void set_register_value(_TYPE_ value) {
++    R = value;
++}
++// CHECK-HAVE-RESERVATION: declare{{.*}} void @llvm.write_register.i[[bits]](metadata, i[[bits]])
++
++int main() {
++    set_register_value(1);
++    int res = get_register_value();
++    set_register_value(2);
++    return res;
++}
++
++// CHECK-HAVE-RESERVATION: !llvm.named.register._REG_ = !{!0}
++// CHECK-HAVE-RESERVATION: !0 = !{!"_REG_"}
+diff --git a/clang/test/Driver/x86_64-fixed-r-register.c b/clang/test/Driver/x86_64-fixed-r-register.c
+new file mode 100644
+index 000000000000..0657b95d608f
+--- /dev/null
++++ b/clang/test/Driver/x86_64-fixed-r-register.c
+@@ -0,0 +1,21 @@
++// RUN: %clang %s -mfixed-r12 -### 2>&1 | FileCheck %s --check-prefix=R12
++// RUN: %clang %s -mfixed-r13 -### 2>&1 | FileCheck %s --check-prefix=R13
++// RUN: %clang %s -mfixed-r14 -### 2>&1 | FileCheck %s --check-prefix=R14
++// RUN: %clang %s -mfixed-r15 -### 2>&1 | FileCheck %s --check-prefix=R15
++
++// RUN: %clang %s -mfixed-r12 -mfixed-r13 -### 2>&1 | FileCheck %s --check-prefix=R12 --check-prefix=R13
++// RUN: %clang %s -mfixed-r12 -mfixed-r14 -### 2>&1 | FileCheck %s --check-prefix=R12 --check-prefix=R14
++// RUN: %clang %s -mfixed-r12 -mfixed-r15 -### 2>&1 | FileCheck %s --check-prefix=R12 --check-prefix=R15
++// RUN: %clang %s -mfixed-r13 -mfixed-r14 -### 2>&1 | FileCheck %s --check-prefix=R13 --check-prefix=R14
++// RUN: %clang %s -mfixed-r13 -mfixed-r15 -### 2>&1 | FileCheck %s --check-prefix=R13 --check-prefix=R15
++// RUN: %clang %s -mfixed-r14 -mfixed-r15 -### 2>&1 | FileCheck %s --check-prefix=R14 --check-prefix=R15
++
++// RUN: %clang %s -mfixed-r12 -mfixed-r13 -mfixed-r14 -### 2>&1 | FileCheck %s --check-prefix=R12 --check-prefix=R13 --check-prefix=R14
++// RUN: %clang %s -mfixed-r13 -mfixed-r14 -mfixed-r15 -### 2>&1 | FileCheck %s --check-prefix=R13 --check-prefix=R14 --check-prefix=R15
++
++// RUN: %clang %s -mfixed-r12 -mfixed-r13 -mfixed-r14 -mfixed-r15 -### 2>&1 | FileCheck %s --check-prefix=R12 --check-prefix=R13 --check-prefix=R14 --check-prefix=R15
++
++// R12-NOT: error:
++// R13-NOT: error:
++// R14-NOT: error:
++// R15-NOT: error:
+\ No newline at end of file
+diff --git a/llvm/lib/Target/X86/X86.td b/llvm/lib/Target/X86/X86.td
+index 1af007f09383..dc2600364301 100644
+--- a/llvm/lib/Target/X86/X86.td
++++ b/llvm/lib/Target/X86/X86.td
+@@ -30,6 +30,10 @@ def Mode16Bit : SubtargetFeature<"16bit-mode", "In16BitMode", "true",
+ // X86 Subtarget features
+ //===----------------------------------------------------------------------===//
+ 
++foreach i = {12-15} in
++  def FeatureReserveR#i : SubtargetFeature<"fixed-r"#i, "ReservedRRegs["#!sub(i,8)#"]", "true",
++                                         "Reserve r"#i#", making it unavaliable as a GPR">;
++
+ def FeatureX87     : SubtargetFeature<"x87","HasX87", "true",
+                                       "Enable X87 float instructions">;
+ 
+diff --git a/llvm/lib/Target/X86/X86FrameLowering.cpp b/llvm/lib/Target/X86/X86FrameLowering.cpp
+index ed9d3ea0d6be..446d4de74819 100644
+--- a/llvm/lib/Target/X86/X86FrameLowering.cpp
++++ b/llvm/lib/Target/X86/X86FrameLowering.cpp
+@@ -2597,6 +2597,13 @@ void X86FrameLowering::determineCalleeSaves(MachineFunction &MF,
+       BasePtr = getX86SubSuperRegister(BasePtr, 64);
+     SavedRegs.set(BasePtr);
+   }
++
++  if (MF.getSubtarget<X86Subtarget>().is64Bit()) {
++    const BitVector RRegReservation = MF.getSubtarget<X86Subtarget>().getRRegReservation();
++    for (unsigned i = 4; i < RRegReservation.size(); i++)
++      if (RRegReservation[i])
++        SavedRegs.reset(X86::R8 + i);
++  }
+ }
+ 
+ static bool
+diff --git a/llvm/lib/Target/X86/X86ISelLowering.cpp b/llvm/lib/Target/X86/X86ISelLowering.cpp
+index 691398bdccdd..323c1377c5ef 100644
+--- a/llvm/lib/Target/X86/X86ISelLowering.cpp
++++ b/llvm/lib/Target/X86/X86ISelLowering.cpp
+@@ -26643,6 +26643,10 @@ SDValue X86TargetLowering::LowerFRAMEADDR(SDValue Op, SelectionDAG &DAG) const {
+   return FrameAddr;
+ }
+ 
++
++#define GET_REGISTER_MATCHER
++#include "X86GenAsmMatcher.inc"
++
+ // FIXME? Maybe this could be a TableGen attribute on some registers and
+ // this table could be generated automatically from RegInfo.
+ Register X86TargetLowering::getRegisterByName(const char* RegName, LLT VT,
+@@ -26670,6 +26674,17 @@ Register X86TargetLowering::getRegisterByName(const char* RegName, LLT VT,
+ #endif
+   }
+ 
++  if (Reg)
++    return Reg;
++
++  Reg = MatchRegisterName(RegName);
++  if (Reg)
++  {
++    Register RReg = getX86SubSuperRegisterOrZero(Reg, 64);
++    if (X86::R12 <= RReg && RReg <= X86::R15 ? !Subtarget.getRRegReservation()[RReg - X86::R8] : true)
++      Reg = 0;
++  }
++
+   if (Reg)
+     return Reg;
+ 
+diff --git a/llvm/lib/Target/X86/X86RegisterInfo.cpp b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+index 899542cdbb33..fac314dd4d1f 100644
+--- a/llvm/lib/Target/X86/X86RegisterInfo.cpp
++++ b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+@@ -537,6 +537,17 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+   // Set the Shadow Stack Pointer as reserved.
+   Reserved.set(X86::SSP);
+ 
++  // Set r# as reserved register if we need it
++  if (Is64Bit) {
++    const BitVector RRegReservation = MF.getSubtarget<X86Subtarget>().getRRegReservation();
++    for (unsigned i = 4; i < RRegReservation.size(); i++) {
++      if (RRegReservation[i]) {
++        for (const MCPhysReg &SubReg : subregs_inclusive(X86::R8 + i))
++          Reserved.set(SubReg);
++      }
++    }
++  }
++
+   // Set the instruction pointer register and its aliases as reserved.
+   for (const MCPhysReg &SubReg : subregs_inclusive(X86::RIP))
+     Reserved.set(SubReg);
+diff --git a/llvm/lib/Target/X86/X86Subtarget.h b/llvm/lib/Target/X86/X86Subtarget.h
+index 96bb96060543..7748137a0286 100644
+--- a/llvm/lib/Target/X86/X86Subtarget.h
++++ b/llvm/lib/Target/X86/X86Subtarget.h
+@@ -17,6 +17,7 @@
+ #include "X86ISelLowering.h"
+ #include "X86InstrInfo.h"
+ #include "X86SelectionDAGInfo.h"
++#include "llvm/ADT/BitVector.h"
+ #include "llvm/ADT/Triple.h"
+ #include "llvm/CodeGen/TargetSubtargetInfo.h"
+ #include "llvm/IR/CallingConv.h"
+@@ -74,6 +75,9 @@ class X86Subtarget final : public X86GenSubtargetInfo {
+ 
+   const TargetMachine &TM;
+ 
++  /// BitVector for r8-r15 register reservation flag
++  BitVector ReservedRRegs = BitVector(8, false);
++
+   /// SSE1, SSE2, SSE3, SSSE3, SSE41, SSE42, or none supported.
+   X86SSEEnum X86SSELevel = NoSSE;
+ 
+@@ -619,6 +623,10 @@ public:
+   bool hasX87() const { return HasX87; }
+   bool hasCmpxchg8b() const { return HasCmpxchg8b; }
+   bool hasNOPL() const { return HasNOPL; }
++
++  // Reserved registers features
++  BitVector getRRegReservation() const { return ReservedRRegs; }
++
+   // SSE codegen depends on cmovs, and all SSE1+ processors support them.
+   // All 64-bit processors support cmov.
+   bool hasCMov() const { return HasCMov || X86SSELevel >= SSE1 || is64Bit(); }
+diff --git a/llvm/test/CodeGen/X86/x86_64-named-reg-rregs.ll b/llvm/test/CodeGen/X86/x86_64-named-reg-rregs.ll
+new file mode 100644
+index 000000000000..7b25c4fd7f65
+--- /dev/null
++++ b/llvm/test/CodeGen/X86/x86_64-named-reg-rregs.ll
+@@ -0,0 +1,116 @@
++
++; RUN: sed 's/_REG_/r12/g' %s > %t
++; RUN llc -march=x86-64 %t -O0 -o - 2> %t1 || echo
++; RUN FileCheck < %t1 %t --check-prefix=CHECK-NO-RESERVATION
++; RUN: llc -march=x86-64 %t -O0 -mattr=+fixed-r12 -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++; RUN: sed 's/_REG_/r13/g' %s > %t
++; RUN llc -march=x86-64 %t -O0 -o - 2> %t1 || echo
++; RUN FileCheck < %t1 %t --check-prefix=CHECK-NO-RESERVATION
++; RUN: llc -march=x86-64 %t -O0 -mattr=+fixed-r13 -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++; RUN: sed 's/_REG_/r14/g' %s > %t
++; RUN llc -march=x86-64 %t -O0 -o - 2> %t1 || echo
++; RUN FileCheck < %t1 %t --check-prefix=CHECK-NO-RESERVATION
++; RUN: llc -march=x86-64 %t -O0 -mattr=+fixed-r14 -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++; RUN: sed 's/_REG_/r15/g' %s > %t
++; RUN llc -march=x86-64 %t -O0 -o - 2> %t1 || echo
++; RUN FileCheck < %t1 %t --check-prefix=CHECK-NO-RESERVATION
++; RUN: llc -march=x86-64 %t -O0 -mattr=+fixed-r15 -o - | FileCheck %t --check-prefix=CHECK-HAVE-RESERVATION
++
++define i64 @read_reg64() {
++    ; CHECK-HAVE-RESERVATION-NOT: push{{[qlwb]}} %_REG_
++    ; CHECK-HAVE-RESERVATION: %_REG_
++    %r = call i64 @llvm.read_register.i64(metadata !0)
++    ret i64 %r
++    ; CHECK-HAVE-RESERVATION-NOT: pop{{[qlwb]}} %_REG_
++}
++
++define i32 @read_reg32() {
++    ; CHECK-HAVE-RESERVATION-NOT: push{{[qlwb]}} %_REG_
++    ; CHECK-HAVE-RESERVATION: %_REG_d
++    %r = call i32 @llvm.read_register.i32(metadata !1)
++    ret i32 %r
++    ; CHECK-HAVE-RESERVATION-NOT: pop{{[qlwb]}} %_REG_
++}
++
++define i16 @read_reg16() {
++    ; CHECK-HAVE-RESERVATION-NOT: push{{[qlwb]}} %_REG_
++    ; CHECK-HAVE-RESERVATION: %_REG_w
++    %r = call i16 @llvm.read_register.i16(metadata !2)
++    ret i16 %r
++    ; CHECK-HAVE-RESERVATION-NOT: pop{{[qlwb]}} %_REG_
++}
++
++define i8 @read_reg8() {
++    ; CHECK-HAVE-RESERVATION-NOT: push{{[qlwb]}} %_REG_
++    ; CHECK-HAVE-RESERVATION: %_REG_b
++    %r = call i8 @llvm.read_register.i8(metadata !3)
++    ret i8 %r
++    ; CHECK-HAVE-RESERVATION-NOT: pop{{[qlwb]}} %_REG_
++}
++
++define void @write_reg64(i64 %val) {
++    ; CHECK-HAVE-RESERVATION-NOT: push{{[qlwb]}} %_REG_
++    ; CHECK-HAVE-RESERVATION: %_REG_
++    call void @llvm.write_register.i64(metadata !0, i64 %val)
++    ret void
++    ; CHECK-HAVE-RESERVATION-NOT: pop{{[qlwb]}} %_REG_
++}
++
++define void @write_reg32(i32 %val) {
++    ; CHECK-HAVE-RESERVATION-NOT: push{{[qlwb]}} %_REG_
++    ; CHECK-HAVE-RESERVATION: %_REG_d
++    call void @llvm.write_register.i32(metadata !1, i32 %val)
++    ret void
++    ; CHECK-HAVE-RESERVATION-NOT: pop{{[qlwb]}} %_REG_
++}
++
++define void @write_reg16(i16 %val) {
++    ; CHECK-HAVE-RESERVATION-NOT: push{{[qlwb]}} %_REG_
++    ; CHECK-HAVE-RESERVATION: %_REG_w
++    call void @llvm.write_register.i16(metadata !2, i16 %val)
++    ret void
++    ; CHECK-HAVE-RESERVATION-NOT: pop{{[qlwb]}} %_REG_
++}
++
++define void @write_reg8(i8 %val) {
++    ; CHECK-HAVE-RESERVATION-NOT: push{{[qlwb]}} %_REG_
++    ; CHECK-HAVE-RESERVATION: %_REG_b
++    call void @llvm.write_register.i8(metadata !3, i8 %val)
++    ret void
++    ; CHECK-HAVE-RESERVATION-NOT: pop{{[qlwb]}} %_REG_
++}
++
++define i64 @main() {
++    ; CHECK-HAVE-RESERVATION-NOT: push{{[qlwb]}} %_REG_
++
++    ; CHECK-NO-RESERVATION: LLVM ERROR
++    ; CHECK-NO-RESERVATION-SAME: Invalid register name global variable
++
++    %r1 = call i64 @read_reg64()
++    %r2 = call i32 @read_reg32()
++    %r3 = call i16 @read_reg16()
++    %r4 = call i8 @read_reg8()
++    call void @write_reg64(i64 4294967296)
++    call void @write_reg32(i32 65536)
++    call void @write_reg16(i16 256)
++    call void @write_reg8(i8 1)
++
++    ret i64 %r1
++    ; CHECK-HAVE-RESERVATION-NOT: pop{{[qlwb]}} %_REG_
++}
++
++declare i64 @llvm.read_register.i64(metadata)
++declare void @llvm.write_register.i64(metadata, i64)
++declare i32 @llvm.read_register.i32(metadata)
++declare void @llvm.write_register.i32(metadata, i32)
++declare i16 @llvm.read_register.i16(metadata)
++declare void @llvm.write_register.i16(metadata, i16)
++declare i8 @llvm.read_register.i8(metadata)
++declare void @llvm.write_register.i8(metadata, i8)
++!0 = !{!"_REG_\00"}
++!1 = !{!"_REG_d\00"}
++!2 = !{!"_REG_w\00"}
++!3 = !{!"_REG_b\00"}
