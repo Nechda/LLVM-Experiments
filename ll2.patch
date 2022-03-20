@@ -1,0 +1,168 @@
+commit 5b6566b439d98ccef3e07870aa98e3dcdb460356
+Author: Dmitry Nechitaev <nechda6@gmail.com>
+Date:   Sun Mar 20 16:48:12 2022 +0300
+
+    [LLVM][X86] Add fixed-fp option
+
+diff --git a/llvm/lib/Target/X86/X86.td b/llvm/lib/Target/X86/X86.td
+index c390580b9f97..8092aadd0a4b 100644
+--- a/llvm/lib/Target/X86/X86.td
++++ b/llvm/lib/Target/X86/X86.td
+@@ -33,6 +33,8 @@ def Mode16Bit : SubtargetFeature<"16bit-mode", "In16BitMode", "true",
+ foreach i = {12-15} in
+   def FeatureReserveR#i : SubtargetFeature<"fixed-r"#i, "ReservedRRegs["#!sub(i,8)#"]", "true",
+                                          "Reserve r"#i#", making it unavaliable as a GPR">;
++def FeatureReserveFP : SubtargetFeature<"fixed-fp","FixedFP", "true",
++                                        "Reserve rbp, making it unavailable">;
+ 
+ def FeatureX87     : SubtargetFeature<"x87","HasX87", "true",
+                                       "Enable X87 float instructions">;
+diff --git a/llvm/lib/Target/X86/X86FastISel.cpp b/llvm/lib/Target/X86/X86FastISel.cpp
+index bb95ed3ccdc5..8664e9c63ba3 100644
+--- a/llvm/lib/Target/X86/X86FastISel.cpp
++++ b/llvm/lib/Target/X86/X86FastISel.cpp
+@@ -2687,7 +2687,8 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
+ 
+     const X86RegisterInfo *RegInfo = Subtarget->getRegisterInfo();
+     unsigned FrameReg = RegInfo->getPtrSizedFrameRegister(*MF);
+-    assert(((FrameReg == X86::RBP && VT == MVT::i64) ||
++    assert( Subtarget->isFPRegisterReserved() ||
++            ((FrameReg == X86::RBP && VT == MVT::i64) ||
+             (FrameReg == X86::EBP && VT == MVT::i32)) &&
+            "Invalid Frame Register!");
+ 
+diff --git a/llvm/lib/Target/X86/X86FrameLowering.cpp b/llvm/lib/Target/X86/X86FrameLowering.cpp
+index dae328cba943..351468ea12b2 100644
+--- a/llvm/lib/Target/X86/X86FrameLowering.cpp
++++ b/llvm/lib/Target/X86/X86FrameLowering.cpp
+@@ -2216,9 +2216,9 @@ StackOffset X86FrameLowering::getFrameIndexReference(const MachineFunction &MF,
+   // so enforce usage of stack/base pointer.  The base pointer is used when we
+   // have dynamic allocas in addition to dynamic realignment.
+   if (TRI->hasBasePointer(MF))
+-    FrameReg = IsFixed ? TRI->getFramePtr() : TRI->getBaseRegister();
++    FrameReg = IsFixed ? TRI->getFramePtr(MF) : TRI->getBaseRegister();
+   else if (TRI->hasStackRealignment(MF))
+-    FrameReg = IsFixed ? TRI->getFramePtr() : TRI->getStackRegister();
++    FrameReg = IsFixed ? TRI->getFramePtr(MF) : TRI->getStackRegister();
+   else
+     FrameReg = TRI->getFrameRegister(MF);
+ 
+diff --git a/llvm/lib/Target/X86/X86ISelLowering.cpp b/llvm/lib/Target/X86/X86ISelLowering.cpp
+index c7d3f38abe38..df8006066be5 100644
+--- a/llvm/lib/Target/X86/X86ISelLowering.cpp
++++ b/llvm/lib/Target/X86/X86ISelLowering.cpp
+@@ -26841,7 +26841,8 @@ SDValue X86TargetLowering::LowerFRAMEADDR(SDValue Op, SelectionDAG &DAG) const {
+       RegInfo->getPtrSizedFrameRegister(DAG.getMachineFunction());
+   SDLoc dl(Op);  // FIXME probably not meaningful
+   unsigned Depth = Op.getConstantOperandVal(0);
+-  assert(((FrameReg == X86::RBP && VT == MVT::i64) ||
++  assert( Subtarget.isFPRegisterReserved() ||
++          ((FrameReg == X86::RBP && VT == MVT::i64) ||
+           (FrameReg == X86::EBP && VT == MVT::i32)) &&
+          "Invalid Frame Register!");
+   SDValue FrameAddr = DAG.getCopyFromReg(DAG.getEntryNode(), dl, FrameReg, VT);
+@@ -26869,14 +26870,15 @@ Register X86TargetLowering::getRegisterByName(const char* RegName, LLT VT,
+                        .Default(0);
+ 
+   if (Reg == X86::EBP || Reg == X86::RBP) {
+-    if (!TFI.hasFP(MF))
++    if (!TFI.hasFP(MF) && !Subtarget.isFPRegisterReserved())
+       report_fatal_error("register " + StringRef(RegName) +
+                          " is allocatable: function has no frame pointer");
+ #ifndef NDEBUG
+     else {
+       const X86RegisterInfo *RegInfo = Subtarget.getRegisterInfo();
+       Register FrameReg = RegInfo->getPtrSizedFrameRegister(MF);
+-      assert((FrameReg == X86::EBP || FrameReg == X86::RBP) &&
++      assert(Subtarget.isFPRegisterReserved() ||
++             (FrameReg == X86::EBP || FrameReg == X86::RBP) &&
+              "Invalid Frame Register!");
+     }
+ #endif
+@@ -26934,7 +26936,8 @@ SDValue X86TargetLowering::LowerEH_RETURN(SDValue Op, SelectionDAG &DAG) const {
+   EVT PtrVT = getPointerTy(DAG.getDataLayout());
+   const X86RegisterInfo *RegInfo = Subtarget.getRegisterInfo();
+   Register FrameReg = RegInfo->getFrameRegister(DAG.getMachineFunction());
+-  assert(((FrameReg == X86::RBP && PtrVT == MVT::i64) ||
++  assert( Subtarget.isFPRegisterReserved() ||
++          ((FrameReg == X86::RBP && PtrVT == MVT::i64) ||
+           (FrameReg == X86::EBP && PtrVT == MVT::i32)) &&
+          "Invalid Frame Register!");
+   SDValue Frame = DAG.getCopyFromReg(DAG.getEntryNode(), dl, FrameReg, PtrVT);
+@@ -33902,7 +33905,7 @@ X86TargetLowering::emitEHSjLjLongJmp(MachineInstr &MI,
+   Register Tmp = MRI.createVirtualRegister(RC);
+   // Since FP is only updated here but NOT referenced, it's treated as GPR.
+   const X86RegisterInfo *RegInfo = Subtarget.getRegisterInfo();
+-  Register FP = (PVT == MVT::i64) ? X86::RBP : X86::EBP;
++  Register FP = getX86SubSuperRegisterOrZero(RegInfo->getFramePtr(*MF), (PVT == MVT::i64) ? 64 : 32);
+   Register SP = RegInfo->getStackRegister();
+ 
+   MachineInstrBuilder MIB;
+diff --git a/llvm/lib/Target/X86/X86RegisterInfo.cpp b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+index 7f600dc14930..d7bcf63ed137 100644
+--- a/llvm/lib/Target/X86/X86RegisterInfo.cpp
++++ b/llvm/lib/Target/X86/X86RegisterInfo.cpp
+@@ -562,8 +562,8 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+     Reserved.set(SubReg);
+ 
+   // Set the frame-pointer register and its aliases as reserved if needed.
+-  if (TFI->hasFP(MF)) {
+-    for (const MCPhysReg &SubReg : subregs_inclusive(X86::RBP))
++  if (TFI->hasFP(MF) || MF.getSubtarget<X86Subtarget>().isFPRegisterReserved()) {
++    for (const MCPhysReg &SubReg : subregs_inclusive(getX86SubSuperRegisterOrZero(getFramePtr(MF),64)))
+       Reserved.set(SubReg);
+   }
+ 
+@@ -860,9 +860,14 @@ unsigned X86RegisterInfo::findDeadCallerSavedReg(
+   return 0;
+ }
+ 
++Register X86RegisterInfo::getFramePtr(const MachineFunction &MF) const {
++  bool fixed = MF.getSubtarget<X86Subtarget>().isFPRegisterReserved();
++  return fixed ? (Is64Bit ? X86::R13 : X86::EDI) : FramePtr;
++}
++
+ Register X86RegisterInfo::getFrameRegister(const MachineFunction &MF) const {
+   const X86FrameLowering *TFI = getFrameLowering(MF);
+-  return TFI->hasFP(MF) ? FramePtr : StackPtr;
++  return TFI->hasFP(MF) ? getFramePtr(MF) : getStackRegister();
+ }
+ 
+ unsigned
+diff --git a/llvm/lib/Target/X86/X86RegisterInfo.h b/llvm/lib/Target/X86/X86RegisterInfo.h
+index 7fd10ddd1a15..ed2bb03d9a82 100644
+--- a/llvm/lib/Target/X86/X86RegisterInfo.h
++++ b/llvm/lib/Target/X86/X86RegisterInfo.h
+@@ -141,7 +141,7 @@ public:
+   /// This will always returns the frame pointer register, contrary to
+   /// getFrameRegister() which returns the "base pointer" in situations
+   /// involving a stack, frame and base pointer.
+-  Register getFramePtr() const { return FramePtr; }
++  Register getFramePtr(const MachineFunction &MF) const;
+   // FIXME: Move to FrameInfok
+   unsigned getSlotSize() const { return SlotSize; }
+ 
+diff --git a/llvm/lib/Target/X86/X86Subtarget.h b/llvm/lib/Target/X86/X86Subtarget.h
+index 6810aff09747..b7e0e408990d 100644
+--- a/llvm/lib/Target/X86/X86Subtarget.h
++++ b/llvm/lib/Target/X86/X86Subtarget.h
+@@ -78,6 +78,9 @@ class X86Subtarget final : public X86GenSubtargetInfo {
+   /// BitVector for r8-r15 register reservation flag
+   BitVector ReservedRRegs = BitVector(8, false);
+ 
++  /// Is FP reserved register
++  bool FixedFP = false;
++
+   /// SSE1, SSE2, SSE3, SSSE3, SSE41, SSE42, or none supported.
+   X86SSEEnum X86SSELevel = NoSSE;
+ 
+@@ -632,6 +635,9 @@ public:
+   // Reserved registers features
+   BitVector getRRegReservation() const { return ReservedRRegs; }
+ 
++  // Reserved FP register
++  bool isFPRegisterReserved() const { return FixedFP; }
++
+   // SSE codegen depends on cmovs, and all SSE1+ processors support them.
+   // All 64-bit processors support cmov.
+   bool hasCMov() const { return HasCMov || X86SSELevel >= SSE1 || is64Bit(); }
